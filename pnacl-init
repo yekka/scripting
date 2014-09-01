@@ -1,0 +1,68 @@
+#!/usr/bin/env ruby1.9.3
+
+require_relative 'rb/pnacl_common'
+
+def add_specific_options
+
+  $opt.banner = <<EOF
+Usage: #{MYNAME} [OPTION]... BRANCH
+Deploy chromium sources of some BRANCH
+EOF
+
+  $opt.separator ""
+  $opt.separator "Available options:"
+
+  $opt.on('-l', '--list', "Do not deploy, only list available branches") do
+    $opt[:list] = true
+  end
+
+  $opt.on('-d DIR', '--directory DIR', 'Directory to deploy sources in') do |dir|
+    $opt[:directory] = File.absolute_path dir
+  end
+
+  $opt.on('-f', '--force', 'Deploy sources even if directory is not empty') do
+    $opt[:force] = true
+  end
+
+end
+
+def git_pull directory, reponame, branch
+  ShT.chdir directory do
+    ShT.run "git", "remote", "add", reponame, "#{GITSERVER}:#{reponame}"
+    ShT.run "git", "fetch", reponame, %Q{#{branch}:#{branch}}
+    ShT.run "git", "checkout", branch
+  end
+end
+
+Application.run do
+  if $opt[:list]
+    ShT.quiet.run "git ls-remote --heads #{GITSERVER}:pnacl-llvm | sed -e 's/^.*\\\///' | sort"
+    $log.warn "Full list of branches requested, ignored arguments: #{ARGV}" unless @args.empty?
+    exit 0
+  end
+
+  directory = ($opt[:directory] or Dir.pwd)
+  raise UsageError, "What do you want me to do?" if ARGV.size > 1
+  raise UsageError, "You must specify desired branch to deploy" if ARGV.size < 1
+  branch = ARGV[0]
+
+  if File.exists?(directory) and not Dir.empty?(directory) and not $opt[:force]
+    raise %Q{Directory "#{directory}" is not empty}
+  end
+  
+  ShT.run "mkdir", "-p", directory unless File.exists? directory
+  ShT.chdir directory do
+    archive="#{branch}.tar.bz2"
+    download "chromium/#{archive}"
+    ShT.pipe do |r, w|
+      t1 = ShT.async "pbzip2", "-dc", archive, :out => w
+      t2 = ShT.async "tar", "x", :in => r
+      r.close; w.close
+      t1.wait; t2.wait
+    end
+    #ShT.fail(:warn).run "rm", archive
+  end
+  
+  git_pull "#{directory}/src/native_client", "pnacl-nacl", branch
+  git_pull "#{directory}/src/native_client/pnacl/git/llvm", "pnacl-llvm", branch
+end

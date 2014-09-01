@@ -1,0 +1,161 @@
+#!/usr/bin/env ruby1.9.3
+# -*- coding: utf-8 -*-
+
+require 'thread'
+require 'colorize'
+require 'pty'
+#require 'logger'
+#$logger.level = Logger::DEBUG
+
+MYDIR = File.dirname(File.absolute_path $0)
+MYNAME = $0.split('/')[-1]
+
+def bad_usage
+  puts usage
+  exit 1
+end
+
+def usage
+    """USAGE: #{MYNAME} [-{a|c|fc} FILE]... [--] COMMAND...
+    -a      create new log or append to existing log
+    -c      create new log (do not do anything if file exists; the safest option)
+    -fc     force new log creation (delete old file if necessary)"""
+end
+
+bad_usage if ARGV.empty?
+$filename = nil
+$append = true
+$mode = nil
+
+while ARGV[0][0] == "-"
+  fst_arg = ARGV.shift
+  break if fst_arg == "--"
+  $mode = fst_arg
+  case $mode
+  when "-a"
+    $append = true
+    bad_usage if ARGV.empty?
+    $filename = ARGV.shift
+  when "-c"
+    $append = false
+    bad_usage if ARGV.empty?
+    $filename = ARGV.shift
+    if File.exists? $filename
+      $stderr.puts "File already exists: '#{$filename}'"
+      exit 1
+    end
+  when "-fc"
+    $append = false
+    bad_usage if ARGV.empty?
+    $filename = ARGV.shift
+  else
+    bad_usage
+  end
+end
+
+class BufMan
+  def initialize file
+    @file = file
+    @outbuff = ""
+    @errbuff = ""
+    @mutex = Mutex.new
+  end
+  def wrout data
+    @mutex.synchronize do
+        @outbuff += data
+        found = @outbuff.rindex "\n"
+        if found
+            @file.write @outbuff[0..found] if @file
+            $stdout.write @outbuff[0..found]
+            @outbuff = @outbuff[(found + 1)..-1]
+        end
+    end
+  end
+  def wrerr data
+    @mutex.synchronize do
+      @errbuff += data
+        found = @errbuff.rindex "\n"
+        if found
+          @file.write @errbuff[0..found] if @file
+          if $stderr.tty?
+            $stderr.write @errbuff[0..found].red
+          else
+            $stderr.write @errbuff[0..found]
+          end
+            @errbuff = @errbuff[(found + 1)..-1]
+        end
+    end
+  end
+end
+
+if $filename
+  if $append
+    $bufman = BufMan.new (File.open $filename, "a")
+  else
+    $bufman = BufMan.new (File.open $filename, "w")
+  end
+else
+  $bufman = BufMan.new $filename
+end
+
+$childpipe = IO.pipe
+
+def Process.my_spawn(*args)
+  spawnpid = nil
+  forkpid = Process.fork do
+    got = nil
+    begin
+      spawnpid = Process.spawn *args
+      thr = Thread.new do
+        $childpipe[0].read
+      end
+      thr.abort_on_exception = true # TODO не уверен, что работает
+      # Можно еще Thread.main.raise $!
+      got = Process.wait spawnpid
+    ensure
+      unless got
+        Process.kill spawnpid
+        Process.wait spawnpid
+      end
+      Kernel.exit! $?.exitstatus
+    end
+  end
+  return forkpid
+end
+
+
+PTY.open do |m1, s1|
+  PTY.open do |m2, s2|
+    pid = Process.my_spawn(*ARGV, :out => s1, :err => s2)
+    s1.close
+    s2.close
+    thr1 = thr2 = nil
+    #
+    thr1 = Thread.new do
+      begin
+        while data = m1.readpartial(4096)
+          $bufman.wrout data
+        end
+      rescue EOFError
+      rescue Errno::EIO
+      end
+    end
+    #
+    thr2 = Thread.new do
+      begin
+        while data = m2.readpartial(4096)
+          $bufman.wrerr data
+        end
+      rescue EOFError
+      rescue Errno::EIO
+      end
+    end
+    #
+    Process.wait pid
+    $rc = $?.exitstatus
+    thr1.join if thr1
+    thr2.join if thr2
+  end
+end
+
+exit $rc

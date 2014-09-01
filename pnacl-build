@@ -1,0 +1,78 @@
+#!/usr/bin/env ruby1.9.3
+
+require 'set'
+require_relative 'rb/pnacl_common'
+
+# TODO: describe available targets in help
+
+def $opt.add_specific_options
+  self.banner = "Usage: #{MYNAME} [OPTION]... TARGET..."
+  separator ""
+  separator "Available options:"
+  on('-d DIR', '--directory DIR', 'Root of the source tree (can be autodected)') do |dir|
+    self[:directory] = File.absolute_path dir
+  end
+end
+
+def build_toolchain translator
+  rev = nil
+  ShT.moist.chdir "#{$opt[:directory]}/src/native_client"
+  ShT.pipe do |r, w|
+    ShT.moist.run "git svn info | grep Revision | awk '{print $2}'", :out => w
+    w.close
+    rev = r.gets.chomp
+    assert /\d+/.match(rev)
+  end
+  translator_option = "false"
+  translator_option = "true" if translator
+  ShT.run ({ "BUILDBOT_GOT_REVISION" => "#{rev}" }), "buildbot/buildbot_pnacl.sh", \
+      "tc-build-all", "pnacl_linux_x86", "false", translator_option
+  ShT.run "cp", "pnacl-toolchain.tgz", "toolchain/.tars/naclsdk_pnacl_linux_x86.tgz"
+  if translator
+    ShT.run "cp", "pnacl-translator.tgz", "toolchain/.tars/naclsdk_pnacl_translator.tgz"
+  end
+end
+
+def build_sdk ports
+  ShT.chdir "#{$opt[:directory]}/src/native_client_sdk/src"
+  args = [ "build_tools/build_sdk.py", "--tar" ]
+  args << "--build-ports" if ports
+  ShT.run *args
+end
+
+def main
+  targets = Set.new
+  args = $opt.permute ARGV
+  args.each do |arg|
+    case arg
+    when 'toolchain'
+      targets << :toolchain
+    when 'translator'
+      targets << :toolchain
+      targets << :translator
+    when 'sdk'
+      targets << :sdk
+    when 'ports'
+      targets << :sdk
+      targets << :ports
+    else
+      raise UsageError, %Q{Unknown target "#{arg}"}
+    end
+  end
+
+  raise UsageError, "You must specify at least one target to build" if targets.empty?
+
+  $opt[:directory] ||= File.pnacl_root(Dir.pwd)
+  raise "PNaCl sources not found (consider using -d option)" unless $opt[:directory]
+  $log.info "Using #{$opt[:directory]} as root of the PNaCl source tree"
+
+  if targets.include? :toolchain
+    build_toolchain targets.include?(:translator)
+  end
+
+  if targets.include? :sdk
+    build_sdk targets.include?(:ports)
+  end
+end
+
+Application.run
